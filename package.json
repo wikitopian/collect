@@ -1,0 +1,19 @@
+{
+  "name": "collect",
+  "version": "0.0.1",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test:lendingclub:download": "node src/lendingclub/LendingClubDownloader.js",
+    "test:lendingclub:extract": "node src/lendingclub/LendingClubExtractor.js",
+    "test:lendingclub:inspect": "node src/lendingclub/LendingClubInspector.js",
+    "test:lendingclub:load": "node src/lendingclub/LendingClubLoader.js"
+  },
+  "dependencies": {
+    "csv-parse": "^6.2.1",
+    "yauzl": "^3.3.0"
+  }
+}
