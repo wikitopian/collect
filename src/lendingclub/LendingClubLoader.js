@@ -1,185 +1,123 @@
 import { createReadStream } from "node:fs";
-import { mkdir, rm } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
-import { DatabaseSync } from "node:sqlite";
 import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 import zlib from "node:zlib";
 
+import SqlRite from "@possumtech/sqlrite";
 import { parse } from "csv-parse";
 
 export default class LendingClubLoader {
-    static #INTEGER_RE = /^-?\d+$/;
-    static #FLOAT_RE = /^-?\d+(\.\d+)?([eE][+-]?\d+)?$/;
-    static #PERCENT_RE = /^-?\d+(\.\d+)?\s*%$/;
     static #DATE_MON_YYYY_RE = /^[A-Z][a-z]{2}-\d{4}$/;
-    static #TERM_RE = /^\s*\d+\s*months?$/;
-    static #EMP_LENGTH_RE = /^(<\s*1\s*year|10\+?\s*years?|\d+\s*years?)$/;
     static #LOAN_ID_RE = /^\d+$/;
-
     static #MONTHS = Object.freeze({
         Jan: "01", Feb: "02", Mar: "03", Apr: "04", May: "05", Jun: "06",
         Jul: "07", Aug: "08", Sep: "09", Oct: "10", Nov: "11", Dec: "12",
     });
-
-    static #COERCERS = Object.freeze({
-        TEXT: (v) => v,
-        INTEGER: (v) => parseInt(v, 10),
-        REAL: (v) => parseFloat(v),
-        PERCENT: (v) => parseFloat(v.replace(/\s*%$/, "")),
-        DATE: (v) => {
-            const [mon, year] = v.split("-");
-            return `${year}-${LendingClubLoader.#MONTHS[mon]}-01`;
-        },
-        TERM: (v) => parseInt(v.match(/\d+/)[0], 10),
-        EMP_LENGTH: (v) => {
-            const t = v.trim();
-            if (t.startsWith("<")) return 0;
-            return parseInt(t.match(/\d+/)[0], 10);
-        },
-    });
-
-    static #INDEXED_COLUMNS = Object.freeze(["loan_status", "issue_d", "addr_state", "grade"]);
-    static #TABLE_NAME = "accepted_loans";
+    static #BATCH = 1000;
 
     #csvGzPath;
     #dbPath;
+    #sqlDirs;
 
-    constructor({ csvGzPath, dbPath }) {
+    constructor({ csvGzPath, dbPath, sqlDirs }) {
         if (!csvGzPath) throw new Error("LendingClubLoader: csvGzPath required");
         if (!dbPath) throw new Error("LendingClubLoader: dbPath required");
+        if (!sqlDirs) throw new Error("LendingClubLoader: sqlDirs required");
         this.#csvGzPath = csvGzPath;
         this.#dbPath = dbPath;
+        this.#sqlDirs = sqlDirs;
     }
 
     async run() {
-        await mkdir(path.dirname(this.#dbPath), { recursive: true });
-        await rm(this.#dbPath, { force: true });
+        const db = await SqlRite.open({
+            path: this.#dbPath,
+            dir: this.#sqlDirs,
+        });
 
-        console.log("Pass 1: profiling columns...");
-        const pass1 = await this.#profile();
-        console.log(`  ${pass1.rowCount.toLocaleString()} rows profiled (${pass1.skipped} non-loan rows skipped) in ${pass1.elapsed}s`);
+        try {
+            const columnTypes = await this.#resolveColumnTypes(db);
 
-        const types = this.#decideTypes(pass1.profiles, pass1.columns);
-        this.#logTypeSummary(types);
+            console.log("Loading accepted_loans...");
+            const { inserted, skipped, elapsed } = await this.#load(db, columnTypes);
+            console.log(`  ${inserted.toLocaleString()} rows attempted (${skipped} non-loan rows skipped) in ${elapsed}s`);
 
-        console.log("\nPass 2: creating STRICT table and loading...");
-        const pass2 = await this.#load(pass1.columns, types);
-        console.log(`  ${pass2.rowCount.toLocaleString()} rows loaded (${pass2.skipped} non-loan rows skipped) in ${pass2.elapsed}s`);
-        console.log(`\nDone → ${this.#dbPath}`);
+            console.log("\nPopulating collectible_loans from v_collectible_loans...");
+            const populateStart = Date.now();
+            await db.populate_collectible_loans({});
+            console.log(`  done in ${((Date.now() - populateStart) / 1000).toFixed(1)}s`);
 
-        return { pass1, pass2, types };
+            const { n: accepted } = await db.count_accepted_loans.get({});
+            const { n: collectible } = await db.count_collectible_loans.get({});
+            console.log(`\naccepted_loans:    ${accepted.toLocaleString()}`);
+            console.log(`collectible_loans: ${collectible.toLocaleString()}`);
+            console.log(`\nDone → ${this.#dbPath}`);
+        } finally {
+            await db.close();
+        }
     }
 
-    #streamCsv(consumer) {
-        return pipeline(
+    async #resolveColumnTypes(db) {
+        const rows = await db.accepted_loans_column_info.all({ table_name: "accepted_loans" });
+        return new Map(rows.map((r) => [r.name, r.type]));
+    }
+
+    async #load(db, columnTypes) {
+        let inserted = 0;
+        let skipped = 0;
+        const startedAt = Date.now();
+
+        await db.begin_tx({});
+        await pipeline(
             createReadStream(this.#csvGzPath),
             zlib.createGunzip(),
             parse({ columns: true, bom: true }),
-            consumer,
+            async (source) => {
+                let pending = [];
+                for await (const record of source) {
+                    if (!LendingClubLoader.#LOAN_ID_RE.test(record.id)) { skipped++; continue; }
+                    const row = {};
+                    for (const [col, sqlType] of columnTypes) {
+                        row[col] = LendingClubLoader.#coerce(record[col], sqlType);
+                    }
+                    pending.push(db.insert_accepted_loan.run(row));
+                    inserted++;
+                    if (pending.length >= LendingClubLoader.#BATCH) {
+                        await Promise.all(pending);
+                        pending = [];
+                    }
+                    if (inserted % 50_000 === 0) {
+                        process.stderr.write(`\r  ${inserted.toLocaleString()} rows attempted`);
+                    }
+                }
+                if (pending.length > 0) await Promise.all(pending);
+            },
         );
-    }
-
-    async #profile() {
-        const profiles = new Map();
-        let columns = null;
-        let rowCount = 0;
-        let skipped = 0;
-        const startedAt = Date.now();
-
-        await this.#streamCsv(async (source) => {
-            for await (const record of source) {
-                if (!columns) {
-                    columns = Object.keys(record);
-                    for (const c of columns) profiles.set(c, LendingClubLoader.#freshProfile());
-                }
-                if (!LendingClubLoader.#LOAN_ID_RE.test(record.id)) { skipped++; continue; }
-                for (const c of columns) LendingClubLoader.#observe(profiles.get(c), record[c]);
-                rowCount++;
-                if (rowCount % 200_000 === 0) {
-                    process.stderr.write(`\r  ${rowCount.toLocaleString()} rows profiled`);
-                }
-            }
-        });
+        await db.commit_tx({});
         process.stderr.write("\n");
 
         const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
-        return { profiles, columns, rowCount, skipped, elapsed };
+        return { inserted, skipped, elapsed };
     }
 
-    #decideTypes(profiles, columns) {
-        return new Map(columns.map((c) => [c, LendingClubLoader.#decideType(profiles.get(c))]));
-    }
+    static #coerce(v, sqlType) {
+        if (LendingClubLoader.#isNullLike(v)) return null;
+        if (typeof v !== "string") return v;
+        const s = v.trim();
 
-    #logTypeSummary(types) {
-        const typeCounts = new Map();
-        for (const { sqlType, coerce } of types.values()) {
-            const label = coerce === sqlType ? sqlType : `${sqlType} (${coerce})`;
-            typeCounts.set(label, (typeCounts.get(label) ?? 0) + 1);
+        if (sqlType === "TEXT") {
+            if (LendingClubLoader.#DATE_MON_YYYY_RE.test(s)) return LendingClubLoader.#parseMonYyyy(s);
+            return s;
         }
-        console.log("\nColumn types:");
-        for (const [label, n] of [...typeCounts.entries()].toSorted((a, b) => b[1] - a[1])) {
-            console.log(`  ${String(n).padStart(3)}  ${label}`);
+        if (sqlType === "INTEGER") {
+            if (s.startsWith("<")) return 0;
+            return parseInt(s, 10);
         }
-    }
-
-    async #load(columns, types) {
-        const db = new DatabaseSync(this.#dbPath);
-        this.#configureDb(db);
-        this.#createTable(db, columns, types);
-        const result = await this.#insertRows(db, columns, types);
-        this.#createIndexes(db);
-        db.close();
-        return result;
-    }
-
-    #configureDb(db) {
-        db.exec("PRAGMA journal_mode = MEMORY");
-        db.exec("PRAGMA synchronous = OFF");
-        db.exec("PRAGMA temp_store = MEMORY");
-    }
-
-    #createTable(db, columns, types) {
-        const colDefs = columns.map((c) => `"${c}" ${types.get(c).sqlType}`).join(", ");
-        db.exec(`CREATE TABLE ${LendingClubLoader.#TABLE_NAME} (${colDefs}) STRICT`);
-    }
-
-    async #insertRows(db, columns, types) {
-        const placeholders = columns.map(() => "?").join(", ");
-        const colList = columns.map((c) => `"${c}"`).join(", ");
-        const stmt = db.prepare(`INSERT INTO ${LendingClubLoader.#TABLE_NAME} (${colList}) VALUES (${placeholders})`);
-
-        let rowCount = 0;
-        let skipped = 0;
-        const startedAt = Date.now();
-        db.exec("BEGIN");
-        await this.#streamCsv(async (source) => {
-            for await (const record of source) {
-                if (!LendingClubLoader.#LOAN_ID_RE.test(record.id)) { skipped++; continue; }
-                const values = columns.map((c) => {
-                    const v = record[c];
-                    if (LendingClubLoader.#isNullLike(v)) return null;
-                    return LendingClubLoader.#COERCERS[types.get(c).coerce](v);
-                });
-                stmt.run(...values);
-                rowCount++;
-                if (rowCount % 50_000 === 0) {
-                    process.stderr.write(`\r  ${rowCount.toLocaleString()} rows loaded`);
-                }
-            }
-        });
-        db.exec("COMMIT");
-        process.stderr.write("\n");
-
-        const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
-        return { rowCount, skipped, elapsed };
-    }
-
-    #createIndexes(db) {
-        for (const col of LendingClubLoader.#INDEXED_COLUMNS) {
-            db.exec(`CREATE INDEX "idx_${LendingClubLoader.#TABLE_NAME}_${col}" ON ${LendingClubLoader.#TABLE_NAME}("${col}")`);
+        if (sqlType === "REAL") {
+            return parseFloat(s);
         }
+        return s;
     }
 
     static #isNullLike(v) {
@@ -189,47 +127,9 @@ export default class LendingClubLoader {
         return s.toLowerCase() === "n/a";
     }
 
-    static #freshProfile() {
-        return {
-            locked: false, nonEmpty: 0, empty: 0,
-            intOk: 0, floatIntegerValued: 0, floatFractional: 0,
-            percentOk: 0, dateOk: 0, termOk: 0, empLengthOk: 0, other: 0,
-        };
-    }
-
-    static #observe(p, raw) {
-        if (LendingClubLoader.#isNullLike(raw)) { p.empty++; return; }
-        p.nonEmpty++;
-        if (p.locked) { p.other++; return; }
-        const v = raw;
-        if (LendingClubLoader.#INTEGER_RE.test(v)) { p.intOk++; return; }
-        if (LendingClubLoader.#FLOAT_RE.test(v)) {
-            const n = parseFloat(v);
-            if (n === Math.trunc(n)) p.floatIntegerValued++;
-            else p.floatFractional++;
-            return;
-        }
-        if (LendingClubLoader.#PERCENT_RE.test(v)) { p.percentOk++; return; }
-        if (LendingClubLoader.#DATE_MON_YYYY_RE.test(v)) { p.dateOk++; return; }
-        if (LendingClubLoader.#TERM_RE.test(v)) { p.termOk++; return; }
-        if (LendingClubLoader.#EMP_LENGTH_RE.test(v.trim())) { p.empLengthOk++; return; }
-        p.other++;
-        p.locked = true;
-    }
-
-    static #decideType(p) {
-        if (p.nonEmpty === 0) return { sqlType: "TEXT", coerce: "TEXT" };
-        if (p.other > 0) return { sqlType: "TEXT", coerce: "TEXT" };
-        if (p.percentOk === p.nonEmpty) return { sqlType: "REAL", coerce: "PERCENT" };
-        if (p.termOk === p.nonEmpty) return { sqlType: "INTEGER", coerce: "TERM" };
-        if (p.empLengthOk === p.nonEmpty) return { sqlType: "INTEGER", coerce: "EMP_LENGTH" };
-        if (p.dateOk === p.nonEmpty) return { sqlType: "TEXT", coerce: "DATE" };
-        const numericTotal = p.intOk + p.floatIntegerValued + p.floatFractional;
-        if (numericTotal === p.nonEmpty) {
-            if (p.floatFractional === 0) return { sqlType: "INTEGER", coerce: "INTEGER" };
-            return { sqlType: "REAL", coerce: "REAL" };
-        }
-        return { sqlType: "TEXT", coerce: "TEXT" };
+    static #parseMonYyyy(v) {
+        const [mon, year] = v.split("-");
+        return `${year}-${LendingClubLoader.#MONTHS[mon]}-01`;
     }
 }
 
@@ -240,6 +140,10 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     const loader = new LendingClubLoader({
         csvGzPath: path.join(repoRoot, "data/raw/lending-club/accepted_2007_to_2018Q4.csv.gz"),
         dbPath: path.join(repoRoot, "data/lending-club.db"),
+        sqlDirs: [
+            path.join(repoRoot, "migrations"),
+            path.join(repoRoot, "src"),
+        ],
     });
 
     await loader.run();

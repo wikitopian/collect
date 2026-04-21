@@ -7,12 +7,14 @@
     "node": ">=22"
   },
   "scripts": {
+    "test:lendingclub": "npm run test:lendingclub:download && npm run test:lendingclub:extract && npm run test:lendingclub:load",
     "test:lendingclub:download": "node src/lendingclub/LendingClubDownloader.js",
     "test:lendingclub:extract": "node src/lendingclub/LendingClubExtractor.js",
     "test:lendingclub:inspect": "node src/lendingclub/LendingClubInspector.js",
     "test:lendingclub:load": "node src/lendingclub/LendingClubLoader.js"
   },
   "dependencies": {
+    "@possumtech/sqlrite": "^3.1.0",
     "csv-parse": "^6.2.1",
     "yauzl": "^3.3.0"
   }
